@@ -4,6 +4,7 @@
 #include "hardware/irq.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
+#include "hardware/sync.h"          // access to spinlocks
 #include "imu.h"
 
 /*
@@ -23,7 +24,19 @@ volatile int accel_read_idx = 0;
 volatile int gyro_write_idx = 0;
 volatile int gyro_read_idx = 0;
 
+volatile int corenum_0;
+volatile int corenum_1;
+
+spin_lock_t* accel_lock;
+spin_lock_t* gyro_lock;
+
+void init_locks() {
+    accel_lock = spin_lock_instance(spin_lock_claim_unused(true));
+    gyro_lock  = spin_lock_instance(spin_lock_claim_unused(true));
+}
+
 void init_i2c() {
+    // TODO: is a state-machine style of logic more suited to the I2C pipeline?
     
     // initialize the i2c channel and 2 wire pins
     i2c_init(I2C_CHAN, IMU_BAUD_RATE);
@@ -100,6 +113,7 @@ void data_ready_isr(uint gpio, uint32_t events) {
     i2c_read_blocking(I2C_CHAN, IMU_ADDRESS, &status, 1, true);
 
     if(status & 0x01) {
+        // TODO: print which coreid we are running this on, for posterity
         read_imu();
     }
 }
@@ -120,6 +134,22 @@ void read_imu() {
     i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, &accel_start_register, 1, true);
     i2c_read_blocking(I2C_CHAN, IMU_ADDRESS, temp_buffer, 6, false);
 
+    /*
+        spinlocks SDK:
+            - spin_lock_blocking() / spin_unlock():
+                - disables interrupts while holding the lock
+                - this ensures the CPU isn't interrupted during the critical section
+                - this guarantees thread safety
+                - note: this prevents handling any interrupts during the lock, which may cause delays in handling other events
+
+            - spin_lock_unsafe_blocking() / spin_unlock_unsafe():
+                - does not disable interrupts
+                - allows the CPU to handle interrupts while waiting for the lock or while holding it
+                - this can be useful for high-priority or time-sensitive tasks
+                - note: this requires more care to avoid potential issues (like race conditions)
+    */
+
+    spin_lock_blocking(accel_lock);
     for(int i = 0; i < 3; i++) {
         // buffer elements 0, 2, 4 are the most significant components of the reading
         // we concatenate these with their respective subsequent readings
@@ -127,16 +157,20 @@ void read_imu() {
         accel_buffer[accel_write_idx++] = temp_accel;
         accel_write_idx %= BUFFER_SIZE;
     }
+    spin_unlock(accel_lock);
 
     uint8_t gyro_start_register = 0x43;
     i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, &gyro_start_register, 1, true);
     i2c_read_blocking(I2C_CHAN, IMU_ADDRESS, temp_buffer, 6, false);
 
+
+    spin_lock_blocking(gyro_lock);
     for(int i = 0; i < 3; i++) {
         temp_gyro = (temp_buffer[i << 1] << 8) | temp_buffer[(i << 1) + 1];
         gyro_buffer[gyro_write_idx++] = temp_gyro;
         gyro_write_idx %= BUFFER_SIZE;
     }
+    spin_unlock(gyro_lock);
 }
 
 void core1_entry() {
@@ -149,8 +183,8 @@ void core1_entry() {
 
 int main(void) {
     // initialize the standard I/O system on the RP2040 to communicate over UART/USB
-    stdio_init_all();   
-    
+    stdio_init_all();
+    init_locks();
     multicore_launch_core1(core1_entry);
 
     // step 5: transmit the data outward over USB/UART
