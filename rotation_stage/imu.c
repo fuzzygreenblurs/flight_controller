@@ -3,6 +3,7 @@
 #include "pico/multicore.h"
 #include "hardware/irq.h"
 #include "hardware/i2c.h"
+#include "hardware/gpio.h"
 #include "imu.h"
 
 /*
@@ -22,6 +23,32 @@ volatile int accel_read_idx = 0;
 volatile int gyro_write_idx = 0;
 volatile int gyro_read_idx = 0;
 
+void init_i2c() {
+    
+    // initialize the i2c channel and 2 wire pins
+    i2c_init(I2C_CHAN, IMU_BAUD_RATE);
+    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
+    
+    // setup pin to monitor data-ready interrupts from IMU
+    gpio_init(IMU_INT_PIN);
+    gpio_set_dir(IMU_INT_PIN, GPIO_IN);
+    
+    // software based pull-ups to accommodate I2C standard expectations
+    gpio_pull_up(SDA_PIN);     
+    gpio_pull_up(SCL_PIN);
+    gpio_pull_up(IMU_INT_PIN);
+
+    /*
+        note: GPIO interrupts on the RP2040 aren't enabled by default, even though individual pins can be configured for 
+        interrupt generation using gpio_set_irq_enabled(). the interrupt handler for the GPIO bank itself must be enabled 
+        to allow the CPU to respond to any GPIO-triggered interrupts
+    */
+    irq_set_enabled(IO_IRQ_BANK0, true)                          // emable the interrupt handler for the whole GPIO bank
+    gpio_set_irq_enabled(IMU_INT_PIN, GPIO_IRQ_EDGE_FALL, true); // configure the INT_PIN to trigger an interrupt flag on falling edge
+    gpio_set_irq_callback(&data_ready_isr);                      // bind the ISR callback to the IRQ
+}
+
 void init_imu() {
     // reset imu: see MPU6050 register map (reg: 0x6B) for further config details 
     const uint8_t reset_cmd[] = {0x6B, 0x00};
@@ -40,12 +67,44 @@ void init_imu() {
     const uint8_t gyro_config[] = {0x1B, 0x00};
     i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, gyro_config, 2, false);
 
-    // enable data-ready interrupt from MPU6050
-    uint8_t interrupt_config = {0x38, 0x01};
+    // set data-ready interrupt pin to active-low
+    const uint8_t interrupt_config[] = {0x37, 0x80};
     i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, interrupt_config, 2, false);
+
+    // enable data-ready interrupt from MPU6050
+    const uint8_t enable_interrupt[] = {0x38, 0x01};
+    i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, enable_interrupt, 2, false);
 }
 
-void imu_read_raw() {
+void data_ready_isr(uint gpio, uint32_t events) {
+    /*
+        why are we doing this redundant step of triggering the interrupt through the GPIO and then checking the status?
+            POINT 1:
+                - a GPIO is used to trigger for this ISR by pulling that line low if an interrupt occurs
+                - however, the IMU can trigger an interrupt on that pin for many reasons, not just data-ready
+                - thus, we need to check the data-ready bit status on the interrupt status register first
+
+            POINT 2:
+                - avoid race conditions: between the interrupt being triggered and data actually being ready on IMU
+
+            POINT 3:
+                - in some sensors, the INTERRUPT_STATUS register must be read to clear the interrupt flag on the device
+                - without reading this register, the device might keep this interrupt active and not raise new flags if new data
+                becomes available
+    */
+
+    uint8_t int_status_reg = 0x3A;
+    uint8_t status;
+
+    i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, &int_status_reg, 1, true);
+    i2c_read_blocking(I2C_CHAN, IMU_ADDRESS, &status, 1, true);
+
+    if(status & 0x01) {
+        read_imu();
+    }
+}
+
+void read_imu() {
     int16_t temp_accel, temp_gyro;
     uint8_t temp_buffer[6];
 
@@ -80,20 +139,6 @@ void imu_read_raw() {
     }
 }
 
-void init_i2c() {
-    i2c_init(I2C_CHAN, IMU_BAUD_RATE);
-    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
-    
-    // software based pull-ups to accommodate I2C standard expectations
-    gpio_pull_up(SDA_PIN);     
-    gpio_pull_up(SCL_PIN);
-
-    // setup pin to monitor data-ready interrupts from IMU
-    gpio_init(IMU_INT_PIN);
-    gpio_set_dir(IMU_INT_PIN, GPIO_IN);
-}
-
 void core1_entry() {
     // clear any hanging interrupts
     multicore_fifo_clear_irq(); 
@@ -105,13 +150,9 @@ void core1_entry() {
 int main(void) {
     // initialize the standard I/O system on the RP2040 to communicate over UART/USB
     stdio_init_all();   
-
-    // start core 1 - Do this before any interrupt configuration
+    
     multicore_launch_core1(core1_entry);
 
-    // step 2: CORE_1: enable the data ready interrupt on the mpu6050
-    // step 3  : initialize interrupts on the rp2040
-    // step 4: use a circular buffer/FIFO to store incoming data
     // step 5: transmit the data outward over USB/UART
 */
 
