@@ -26,12 +26,7 @@ typedef signed int fix15;
 #define divfix15(a,b) (fix)(((( signed long long)(a) << 15) / (b)))
 #define sqrtfix15(a) (float2fix(sqrt(fix2float(a))))
 
-
-
-
-
-
-
-
 void imu_reset();
 void imu_read_raw(fix15 accel[3], fix15 gyro[3]);
+void data_ready_isr(uint gpio, uint32_t events);
+void read_imu();

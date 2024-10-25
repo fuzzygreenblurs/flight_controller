@@ -1,3 +1,58 @@
+// #include <stdio.h>
+// #include "pico/stdlib.h"
+// #include "pico/multicore.h"
+// #include "hardware/irq.h"
+// #include "hardware/adc.h"
+ 
+// // Core 1 interrupt Handler
+// void core1_interrupt_handler() {
+
+//     // Receive Raw Value, Convert and Print Temperature Value
+//     while (multicore_fifo_rvalid()){
+//         uint16_t raw = multicore_fifo_pop_blocking();
+//         const float conversion_factor = 3.3f / (1 << 12);
+//         float result = raw * conversion_factor;
+//         float temp = ((27 - (result - 0.706) / 0.001721) * 9.0f / 5.0f) + 32.0f;
+//         printf("Temp = %f Fah.\n", temp);        
+//     }
+
+//     multicore_fifo_clear_irq(); // Clear interrupt
+// }
+
+// // Core 1 Main Code
+// void core1_entry() {
+//     // Configure Core 1 Interrupt
+//     multicore_fifo_clear_irq();
+//     irq_set_exclusive_handler(SIO_IRQ_PROC1, core1_interrupt_handler);
+
+//     irq_set_enabled(SIO_IRQ_PROC1, true);
+
+//     // Infinte While Loop to wait for interrupt
+//     while (1){
+//         tight_loop_contents();
+//     }
+// }
+
+// // Core 0 Main Code
+// int main(void){
+//     stdio_init_all();
+
+//     multicore_launch_core1(core1_entry); // Start core 1 - Do this before any interrupt configuration
+
+//     // Configure the ADC
+//     adc_init();
+//     adc_set_temp_sensor_enabled(true); // Enable on board temp sensor
+//     adc_select_input(4);
+
+//     // Primary Core 0 Loop
+//     while (1) {
+//         uint16_t raw = adc_read();
+//         multicore_fifo_push_blocking(raw);
+//         sleep_ms(100);
+//     }
+// }
+
+
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -57,9 +112,9 @@ void init_i2c() {
         interrupt generation using gpio_set_irq_enabled(). the interrupt handler for the GPIO bank itself must be enabled 
         to allow the CPU to respond to any GPIO-triggered interrupts
     */
-    irq_set_enabled(IO_IRQ_BANK0, true)                          // emable the interrupt handler for the whole GPIO bank
-    gpio_set_irq_enabled(IMU_INT_PIN, GPIO_IRQ_EDGE_FALL, true); // configure the INT_PIN to trigger an interrupt flag on falling edge
-    gpio_set_irq_callback(&data_ready_isr);                      // bind the ISR callback to the IRQ
+    irq_set_enabled(IO_IRQ_BANK0, true);                          // emable the interrupt handler for the whole GPIO bank
+    gpio_set_irq_enabled(IMU_INT_PIN, GPIO_IRQ_EDGE_FALL, true);  // configure the INT_PIN to trigger an interrupt flag on falling edge
+    gpio_set_irq_callback(&data_ready_isr);                       // bind the ISR callback to the IRQ
 }
 
 void init_imu() {
@@ -130,7 +185,7 @@ void read_imu() {
             - main isn't writing any actual data to the register, just telling the IMU where to start reading from
             - i.e. main (RP2040) tells the IMU, "I want to read data, starting from this register."
     */
-    uint8_t accel_start_register = 0x3B
+    uint8_t accel_start_register = 0x3B;
     i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, &accel_start_register, 1, true);
     i2c_read_blocking(I2C_CHAN, IMU_ADDRESS, temp_buffer, 6, false);
 
@@ -149,7 +204,7 @@ void read_imu() {
                 - note: this requires more care to avoid potential issues (like race conditions)
     */
 
-    spin_lock_blocking(accel_lock);
+    uint32_t accel_saved_state = spin_lock_blocking(accel_lock);
     for(int i = 0; i < 3; i++) {
         // buffer elements 0, 2, 4 are the most significant components of the reading
         // we concatenate these with their respective subsequent readings
@@ -157,20 +212,46 @@ void read_imu() {
         accel_buffer[accel_write_idx++] = temp_accel;
         accel_write_idx %= BUFFER_SIZE;
     }
-    spin_unlock(accel_lock);
+    spin_unlock(accel_lock, accel_saved_state);
 
     uint8_t gyro_start_register = 0x43;
     i2c_write_blocking(I2C_CHAN, IMU_ADDRESS, &gyro_start_register, 1, true);
     i2c_read_blocking(I2C_CHAN, IMU_ADDRESS, temp_buffer, 6, false);
 
-
-    spin_lock_blocking(gyro_lock);
+    uint32_t gyro_saved_state = spin_lock_blocking(gyro_lock);
     for(int i = 0; i < 3; i++) {
         temp_gyro = (temp_buffer[i << 1] << 8) | temp_buffer[(i << 1) + 1];
         gyro_buffer[gyro_write_idx++] = temp_gyro;
         gyro_write_idx %= BUFFER_SIZE;
     }
-    spin_unlock(gyro_lock);
+    spin_unlock(gyro_lock, gyro_saved_state);
+}
+
+bool transmit_imu_telemetry(struct repeating_timer* t) {
+    float accel[3];
+    float gyro[3];
+
+    // TODO: lets use right shifting instead here (2^14 LSB / G)
+    uint32_t accel_saved_state = spin_lock_blocking(accel_lock);
+    accel[0] = ((float) accel_buffer[accel_read_idx]) / 16384.0;
+    accel[1] = ((float) accel_buffer[accel_read_idx + 1]) / 16384.0;
+    accel[2] = ((float) accel_buffer[accel_read_idx + 2]) / 16384.0;
+    accel_read_idx += 3;
+    accel_read_idx %= BUFFER_SIZE;
+    spin_unlock(accel_lock, accel_saved_state);
+    
+    uint32_t gyro_saved_state = spin_lock_blocking(gyro_lock);
+    gyro[0] = ((float) gyro_buffer[gyro_read_idx]) / 131;
+    gyro[1] = ((float) gyro_buffer[gyro_read_idx + 1]) / 131;
+    gyro[2] = ((float) gyro_buffer[gyro_read_idx + 2]) / 131;
+    gyro_read_idx += 3; 
+    gyro_read_idx %= BUFFER_SIZE; 
+    spin_unlock(gyro_lock, gyro_saved_state);
+
+    printf("accel: x=%.2fG, y=%.2fG, z=%.2fG \n", accel[0], accel[1], accel[2]);
+    printf("gyro: x=%.2fdeg/sec, y=%.2fdeg/sec, z=%.2fdeg/sec\n\n", gyro[0], gyro[1], gyro[2]);
+
+    return true;
 }
 
 void core1_entry() {
@@ -182,13 +263,20 @@ void core1_entry() {
 }
 
 int main(void) {
-    // initialize the standard I/O system on the RP2040 to communicate over UART/USB
-    stdio_init_all();
+    stdio_init_all();     // initialize the standard I/O system on the RP2040 to communicate over UART/USB
     init_locks();
     multicore_launch_core1(core1_entry);
 
-    // step 5: transmit the data outward over USB/UART
-*/
+    struct repeating_timer timer;
+    add_repeating_timer_ms(100, transmit_imu_telemetry, NULL, &timer);
 
-    return 0;
+    // while(1) {
+        // printf("testing working USB transmission. everything activated (2:58)...\n");
+        // sleep_ms(200);
+    // }
+
+    // // Keep the main loop active
+    while (true) {
+        tight_loop_contents();
+    }
 }
